@@ -1,0 +1,294 @@
+================================================================================
+ALZHEIMER'S DISEASE CLASSIFICATION - MAIN SOURCE CODE (CONDENSED)
+================================================================================
+Model: Ensemble (ResNet50 + EfficientNetB3) | Accuracy: 85%
+Classes: MildDemented, ModerateDemented, NonDemented, VeryMildDemented
+================================================================================
+
+1. MODEL ARCHITECTURE
+================================================================================
+
+import tensorflow as tf
+from tensorflow.keras import layers, Model, regularizers
+from tensorflow.keras.applications import ResNet50, EfficientNetB3
+
+IMG_SHAPE = (224, 224, 3)
+NUM_CLASSES = 4
+
+def build_ensemble_model(input_shape=IMG_SHAPE, num_classes=NUM_CLASSES):
+    inputs = layers.Input(shape=input_shape, name="input_image")
+    
+    # ResNet50 Branch
+    resnet_base = ResNet50(include_top=False, weights="imagenet", input_tensor=inputs)
+    resnet_base.trainable = False
+    resnet_features = layers.GlobalAveragePooling2D(name="resnet_gap")(resnet_base.output)
+    
+    # EfficientNetB3 Branch
+    efficient_base = EfficientNetB3(include_top=False, weights="imagenet", input_tensor=inputs)
+    efficient_base.trainable = False
+    efficient_features = layers.GlobalAveragePooling2D(name="efficientnet_gap")(efficient_base.output)
+    
+    # Feature Fusion
+    fused = layers.Concatenate(name="feature_fusion")([resnet_features, efficient_features])
+    
+    # Classification Head
+    x = layers.BatchNormalization(name="bn_1")(fused)
+    x = layers.Dense(512, activation="relu", kernel_regularizer=regularizers.l1_l2(l1=1e-5, l2=1e-4))(x)
+    x = layers.BatchNormalization(name="bn_2")(x)
+    x = layers.Dropout(0.6)(x)
+    x = layers.Dense(256, activation="relu")(x)
+    x = layers.Dropout(0.5)(x)
+    x = layers.Dense(128, activation="relu")(x)
+    x = layers.Dropout(0.4)(x)
+    outputs = layers.Dense(num_classes, activation="softmax", name="output")(x)
+    
+    model = Model(inputs=inputs, outputs=outputs, name="AlzheimerEnsemble")
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss="categorical_crossentropy",
+        metrics=["accuracy", tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
+    )
+    return model, resnet_base, efficient_base
+
+def prepare_fine_tuning(model, resnet_base, efficient_base, 
+                        resnet_unfreeze_last=60, efficient_unfreeze_last=50):
+    resnet_base.trainable = True
+    efficient_base.trainable = True
+    
+    for layer in resnet_base.layers[:len(resnet_base.layers) - resnet_unfreeze_last]:
+        layer.trainable = False
+    for layer in efficient_base.layers[:len(efficient_base.layers) - efficient_unfreeze_last]:
+        layer.trainable = False
+    
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=5e-5),
+        loss="categorical_crossentropy",
+        metrics=["accuracy", tf.keras.metrics.Precision(), tf.keras.metrics.Recall()]
+    )
+    return model
+
+
+================================================================================
+2. PREPROCESSING
+================================================================================
+
+import cv2
+import numpy as np
+
+def apply_clahe(image, clip_limit=2.0, tile_grid_size=(8, 8)):
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    l_enhanced = clahe.apply(l_channel)
+    lab_enhanced = cv2.merge([l_enhanced, a_channel, b_channel])
+    return cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
+
+def preprocess_image(image, target_size=(224, 224)):
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    image = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+    image = apply_clahe(image)
+    image = cv2.GaussianBlur(image, (3, 3), 0.5)
+    image = image.astype(np.float32) / 255.0
+    return image
+
+
+================================================================================
+3. DATA LOADER
+================================================================================
+
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.utils import Sequence
+
+CLASS_NAMES = ["MildDemented", "ModerateDemented", "NonDemented", "VeryMildDemented"]
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+
+def get_augmentation_generator():
+    return ImageDataGenerator(
+        rotation_range=15, width_shift_range=0.1, height_shift_range=0.1,
+        zoom_range=0.1, horizontal_flip=True, brightness_range=[0.85, 1.15],
+        fill_mode="nearest"
+    )
+
+class PreprocessedGenerator(Sequence):
+    def __init__(self, keras_gen):
+        self.gen = keras_gen
+    
+    def __len__(self):
+        return len(self.gen)
+    
+    def __getitem__(self, idx):
+        batch_x, batch_y = self.gen[idx]
+        processed = np.zeros_like(batch_x, dtype=np.float32)
+        for i, img in enumerate(batch_x):
+            uint8_img = np.clip(img, 0, 255).astype(np.uint8)
+            processed[i] = preprocess_image(uint8_img, target_size=IMG_SIZE)
+        return processed, batch_y
+    
+    @property
+    def n(self):
+        return self.gen.n
+
+def build_generators(dataset_dir, batch_size=BATCH_SIZE):
+    aug_gen = get_augmentation_generator()
+    plain_gen = ImageDataGenerator()
+    
+    train_raw = aug_gen.flow_from_directory(
+        f"{dataset_dir}/train", target_size=IMG_SIZE, batch_size=batch_size,
+        class_mode="categorical", classes=CLASS_NAMES, shuffle=True
+    )
+    val_raw = plain_gen.flow_from_directory(
+        f"{dataset_dir}/val", target_size=IMG_SIZE, batch_size=batch_size,
+        class_mode="categorical", classes=CLASS_NAMES, shuffle=False
+    )
+    test_raw = plain_gen.flow_from_directory(
+        f"{dataset_dir}/test", target_size=IMG_SIZE, batch_size=batch_size,
+        class_mode="categorical", classes=CLASS_NAMES, shuffle=False
+    )
+    
+    return (PreprocessedGenerator(train_raw), 
+            PreprocessedGenerator(val_raw), 
+            PreprocessedGenerator(test_raw))
+
+
+================================================================================
+4. TRAINING PIPELINE
+================================================================================
+
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+import json
+
+def make_callbacks(phase, save_dir="saved_models"):
+    checkpoint_path = f"{save_dir}/best_model_phase{phase}.keras"
+    return [
+        EarlyStopping(monitor="val_accuracy", patience=7, restore_best_weights=True, verbose=1),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=4, min_lr=1e-7, verbose=1),
+        ModelCheckpoint(filepath=checkpoint_path, monitor="val_accuracy", save_best_only=True, verbose=1)
+    ]
+
+def train(dataset_dir, epochs_p1=20, epochs_p2=30, batch_size=BATCH_SIZE, save_dir="saved_models"):
+    train_gen, val_gen, test_gen = build_generators(dataset_dir, batch_size)
+    steps_per_epoch = max(1, train_gen.n // batch_size)
+    val_steps = max(1, val_gen.n // batch_size)
+    
+    model, resnet_base, eff_base = build_ensemble_model()
+    
+    # Phase 1: Frozen bases
+    history_p1 = model.fit(
+        train_gen, steps_per_epoch=steps_per_epoch, epochs=epochs_p1,
+        validation_data=val_gen, validation_steps=val_steps,
+        callbacks=make_callbacks(phase=1, save_dir=save_dir), verbose=1
+    )
+    
+    # Phase 2: Fine-tuning
+    model = prepare_fine_tuning(model, resnet_base, eff_base)
+    history_p2 = model.fit(
+        train_gen, steps_per_epoch=steps_per_epoch, epochs=epochs_p2,
+        validation_data=val_gen, validation_steps=val_steps,
+        callbacks=make_callbacks(phase=2, save_dir=save_dir), verbose=1
+    )
+    
+    # Save final model
+    model.save(f"{save_dir}/final_model.keras")
+    return model, history_p1, history_p2
+
+
+================================================================================
+5. EVALUATION
+================================================================================
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import confusion_matrix, classification_report, roc_auc_score
+from sklearn.preprocessing import label_binarize
+
+def evaluate(model_path, dataset_dir, batch_size=BATCH_SIZE):
+    model = tf.keras.models.load_model(model_path)
+    _, _, test_gen = build_generators(dataset_dir, batch_size)
+    test_steps = max(1, test_gen.n // batch_size)
+    
+    y_prob_list, y_true_list = [], []
+    for step, (batch_x, batch_y) in enumerate(test_gen):
+        if step >= test_steps:
+            break
+        preds = model.predict(batch_x, verbose=0)
+        y_prob_list.append(preds)
+        y_true_list.append(np.argmax(batch_y, axis=1))
+    
+    y_prob = np.concatenate(y_prob_list, axis=0)
+    y_true = np.concatenate(y_true_list, axis=0)
+    y_pred = np.argmax(y_prob, axis=1)
+    
+    metrics = {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred, average="weighted", zero_division=0),
+        "recall": recall_score(y_true, y_pred, average="weighted", zero_division=0),
+        "f1": f1_score(y_true, y_pred, average="weighted", zero_division=0),
+        "report": classification_report(y_true, y_pred, target_names=CLASS_NAMES, zero_division=0)
+    }
+    
+    y_bin = label_binarize(y_true, classes=list(range(len(CLASS_NAMES))))
+    metrics["roc_auc"] = roc_auc_score(y_bin, y_prob, multi_class="ovr", average="macro")
+    
+    return metrics, y_true, y_pred, y_prob
+
+
+================================================================================
+6. GRAD-CAM VISUALIZATION
+================================================================================
+
+def compute_gradcam(model, img_array, class_index=None, last_conv_layer_name="conv5_block3_out"):
+    grad_model = tf.keras.models.Model(
+        inputs=model.inputs,
+        outputs=[model.get_layer(last_conv_layer_name).output, model.output]
+    )
+    
+    with tf.GradientTape() as tape:
+        inputs = tf.cast(img_array, tf.float32)
+        conv_outputs, predictions = grad_model(inputs)
+        if class_index is None:
+            class_index = tf.argmax(predictions[0]).numpy()
+        class_score = predictions[:, class_index]
+    
+    grads = tape.gradient(class_score, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_outputs = conv_outputs[0]
+    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+    heatmap = tf.squeeze(heatmap)
+    heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-8)
+    return heatmap.numpy()
+
+def overlay_heatmap_on_image(original_img, heatmap, alpha=0.45):
+    h, w = original_img.shape[:2]
+    heatmap_resized = cv2.resize(heatmap, (w, h))
+    heatmap_uint8 = np.uint8(255 * heatmap_resized)
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+    heatmap_rgb = cv2.cvtColor(heatmap_color, cv2.COLOR_BGR2RGB)
+    superimposed = (alpha * heatmap_rgb.astype(np.float32) + 
+                    (1 - alpha) * original_img.astype(np.float32))
+    return np.clip(superimposed, 0, 255).astype(np.uint8)
+
+
+================================================================================
+USAGE EXAMPLE
+================================================================================
+
+# Training
+model, hist1, hist2 = train(dataset_dir="dataset", epochs_p1=20, epochs_p2=30)
+
+# Evaluation
+metrics, y_true, y_pred, y_prob = evaluate("saved_models/final_model.keras", "dataset")
+print(f"Accuracy: {metrics['accuracy']:.4f}")
+print(f"Precision: {metrics['precision']:.4f}")
+print(f"Recall: {metrics['recall']:.4f}")
+print(f"F1 Score: {metrics['f1']:.4f}")
+print(f"ROC AUC: {metrics['roc_auc']:.4f}")
+
+# Prediction
+img = preprocess_image(cv2.imread("test_image.jpg"))
+prediction = model.predict(np.expand_dims(img, axis=0))
+predicted_class = CLASS_NAMES[np.argmax(prediction)]
+
+================================================================================
+END OF SOURCE CODE
+================================================================================

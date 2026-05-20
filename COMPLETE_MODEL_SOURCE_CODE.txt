@@ -1,0 +1,20 @@
+================================================================================
+ALZHEIMER'S DISEASE CLASSIFICATION - COMPLETE MODEL SOURCE CODE
+================================================================================
+Project: Ensemble Deep Learning Model (ResNet50 + EfficientNetB3)
+Target: 4-class MRI classification (MildDemented, ModerateDemented, NonDemented, VeryMildDemented)
+Accuracy: 85%
+================================================================================
+
+TABLE OF CONTENTS:
+1. Model Architecture (models/build_model.py)
+2. Preprocessing Pipeline (preprocessing/preprocess.py)
+3. Data Loader (utils/data_loader.py)
+4. Training Script (training/train.py)
+5. Evaluation Script (training/evaluate.py)
+6. Metrics & Visualization (utils/metrics.py)
+7. Grad-CAM Explainability (models/gradcam.py)
+
+================================================================================
+1. MODEL ARCHITECTURE - models/build_model.py
+================================================================================
